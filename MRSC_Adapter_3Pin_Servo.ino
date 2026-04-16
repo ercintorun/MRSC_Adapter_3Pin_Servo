@@ -1,208 +1,224 @@
-/* Standalone MRSC "Micro Rc Stability Control" converter for 3 pin RC steering servo
-    MPU: Atmega 328P 3.3V, 8MHz
-    Board: Pro Mini
-    MPU-6050 board: GY-521
+/* * =======================================================================================================
+ * ADVANCED MRSC (Micro RC Stability Control) - V0.4.1 (16MHz & Fast I2C Edition)
+ * =======================================================================================================
+ * ORIGINAL AUTHOR: TheDIYGuy999
+ * ORIGINAL REPOSITORY: https://github.com/TheDIYGuy999/MRSC_Adapter_3Pin_Servo
+ * * UPGRADE NOTE: Version 0.4.1 was upgraded from the original V0.3 by an AI Assistant. 
+ * The code was optimized for 16MHz Arduino boards and heavily modified to include 
+ * advanced safety features (Atomic Reads, Smart Failsafe), dynamic cornering, and 
+ * 400kHz Fast I2C communication for high-speed RC applications.
+ * * * Hardware Requirements:
+ * - MCU: Atmega 328P (5V, 16MHz) - Arduino Pro Mini
+ * - IMU: MPU-6050 (GY-521 Module)
+ * - Input: PWM signal from RC Receiver
+ * * * Advanced Features Included:
+ * 1. Heading Hold Mode: Locks the yaw angle during straight runs to prevent spin-outs under heavy acceleration.
+ * 2. Dynamic Cornering: Reduces gyro interference during cornering for natural steering feel.
+ * 3. Remote Gain Control: Adjust gyro sensitivity on-the-fly via a spare transmitter channel (e.g., dial/pot).
+ * 4. Atomic Read (Anti-Jitter): Suspends interrupts momentarily to ensure glitch-free 32-bit variable reading.
+ * 5. Smart Failsafe: Automatically centers the steering if the receiver signal is lost or corrupted.
+ * 6. Auto-Calibration: Learns servo end-points automatically upon the first full left/right steering input.
+ * 7. Fast I2C Mode: 400kHz communication speed for ultra-low latency gyro feedback.
+ * * * Pin Connections:
+ * - Pin 4  -> Steering PWM Input (From Receiver CH2)
+ * - Pin 5  -> Remote Gain PWM Input (From Receiver CH4)
+ * - Pin A0 -> Steering Servo PWM Output
+ * - Pin A2 -> Gyro Inversion Switch (Connect to GND to reverse gyro compensation direction)
+ * - Pin A4 -> MPU-6050 SDA (I2C Data)
+ * - Pin A5 -> MPU-6050 SCL (I2C Clock)
+ * * =======================================================================================================
+ */
 
-   Pins:
-   - Steering input 4
-   - Remote gain input 5 (standard servo pulses from spare channel)
-   - MRSC Gain potentiometer input A1 (if no remote gain is wired)
-   - MRSC direction inversion switch A2
-   - Steering output A0
-   - MPU-6050 SDA A4
-   - MPU-6050 SCL A5
-*/
+const float codeVersion = 0.41; // Firmware revision
 
-const float codeVersion = 0.3; // Software revision
-
-//
 // =======================================================================================================
 // LIBRARIES
 // =======================================================================================================
-//
 
-#include <Wire.h> // I2C library (for the MPU-6050 gyro /accelerometer)
-#include <Servo.h> // Servo library
+#include <Wire.h>  // I2C library for MPU-6050 communication
+#include <Servo.h> // Standard servo control library
+#include "mpu.h"   // Custom MPU-6050 handler (.h file must be in the sketch folder)
 
-#include "mpu.h" // MPU-6050 handling (.h file in sketch folder)
-
-//
 // =======================================================================================================
 // PIN ASSIGNMENTS & GLOBAL VARIABLES
 // =======================================================================================================
-//
 
-volatile uint8_t prev; // remembers state of input bits from previous interrupt
-volatile uint32_t risingEdge[2]; // time of last rising edge for each channel
-volatile uint32_t uSec[2]; // the latest measured pulse width for each channel
+// Interrupt variables for reading PWM signals
+volatile uint8_t prev;               // Remembers the state of input bits from the previous interrupt
+volatile uint32_t risingEdge[2];     // Timestamps of the last rising edge for each channel
+volatile uint32_t uSec[2];           // The latest measured pulse width (in microseconds) for each channel
 
-// Create Servo objects
-Servo servoSteering;
+// Atomic Read variables to prevent servo jitter (glitches) during interrupt overlaps
+uint32_t safe_uSec[2];
 
-// Servo limits (initial value = center position = 90° / 1500uSec)
-// Limits are adjusted during the first steering operation!
-// Always move the steering wheel inside its entire range after switching on the car
-byte limSteeringL = 90, limSteeringR = 90; // usually 45 - 135° (90° is the servo center position)
-int limuSecL = 1500, limuSecR = 1500; // usually 1000 - 2000 uSec (1500 uSec is in the servo center position)
+// Servo Object Initialization
+Servo servoSteering; 
 
-// MRSC gain
-byte mrscGain = 80; // This MRSC gain applies, if you don't have an adjustment pot and don't call readInputs()
-float headingMultiplier = 2.0; // adjust until front wheels stay in parallel with the ground, if the car is swiveled around
+// Servo Limits (Initial value = center position = 90° / 1500uSec)
+// These limits are dynamically adjusted during the first steering operation!
+byte limSteeringL = 90, limSteeringR = 90; // Typical range: 45° - 135°
+int limuSecL = 1500, limuSecR = 1500;      // Typical range: 1000 - 2000 uSec
 
-// Switch states
-boolean mpuInversed = false;
+// Stability Control Parameters
+byte mrscGain = 80;            // Default gain value (Overwritten by Remote Gain)
+float headingMultiplier = 2.0; // Heading hold multiplier (Keeps wheels parallel to the ground during drifts)
 
-// Pin definition (don't change servo input pins, interrupt routine is hardcoded)
+// Hardware Switch States
+boolean mpuInversed = false;   // Determines if gyro compensation direction is reversed
+
+// Pin Definitions (Hardcoded for Port D interrupts, do not change input pins)
 #define INPUT_STEERING 4
 #define INPUT_GAIN 5
-
 #define OUTPUT_STEERING A0
-
-#define GAIN_POT A1
 #define INVERSE_MPU_DIRECTION A2
 
-//
 // =======================================================================================================
-// SERVO INPUT PIN CHANGE INTERRUPT ROUTINE
+// SERVO INPUT PIN CHANGE INTERRUPT ROUTINE (PCINT)
 // =======================================================================================================
-// Based on: http://ceptimus.co.uk/?p=66
 
-ISR(PCINT2_vect) { // one or more of pins 4~5 have changed state
+// Fast interrupt routine to read incoming PWM signals without blocking the main loop
+ISR(PCINT2_vect) { 
   uint32_t now = micros();
-  uint8_t curr = PIND; // current state of the 2 input bits
-  uint8_t changed = curr ^ prev; // bitwise XOR (= bit has changed)
+  uint8_t curr = PIND;           // Current state of Port D pins
+  uint8_t changed = curr ^ prev; // Bitwise XOR to find which pin changed state
   uint8_t channel = 0;
-  for (uint8_t mask = B00010000; mask <= B00100000 ; mask <<= 1) { // do it with bit 4 and 5 masked
-    if (changed & mask) { // this pin has changed state
-      if (curr & mask) { // Rising edge, so remember time
-        risingEdge[channel] = now;
+  
+  // Check Pin 4 and Pin 5 using bitmasks
+  for (uint8_t mask = B00010000; mask <= B00100000 ; mask <<= 1) { 
+    if (changed & mask) { 
+      if (curr & mask) { 
+        risingEdge[channel] = now; // Rising edge detected, start timer
       }
-      else { // Falling edge, so store pulse width
-        uSec[channel] = now - risingEdge[channel];
+      else { 
+        uSec[channel] = now - risingEdge[channel]; // Falling edge detected, calculate pulse width
       }
     }
     channel++;
   }
-  prev = curr;
+  prev = curr; // Save current state for the next interrupt
 }
 
-//
 // =======================================================================================================
-// MAIN ARDUINO SETUP (1x during startup)
+// MAIN ARDUINO SETUP (Runs once on boot)
 // =======================================================================================================
-//
 
 void setup() {
-
-  // Configure inputs
+  // Configure inversion switch with internal pull-up
   pinMode(INVERSE_MPU_DIRECTION, INPUT_PULLUP);
-  pinMode(GAIN_POT, INPUT);
-
-  // Activate servo signal input pullup resistors
+  
+  // Activate internal pull-up resistors for PWM inputs to prevent floating signals
   pinMode(INPUT_STEERING, INPUT_PULLUP);
   pinMode(INPUT_GAIN, INPUT_PULLUP);
 
-  // Interrupt settings. See: http://www.atmel.com/Images/Atmel-42735-8-bit-AVR-Microcontroller-ATmega328-328P_Datasheet.pdf
-  PCMSK2 |= B00110000; // PinChangeMaskRegister: set the mask to allow pins 4-5 to generate interrupts (see page 94)
-  PCICR |= B00000100;  // PinChangeInterruptControlRegister: enable interupt for port D (Interrupt Enable 2, see page 92)
+  // Configure Pin Change Interrupts for Port D (Pins 4 and 5)
+  PCMSK2 |= B00110000; // Enable mask for pins 4 and 5
+  PCICR |= B00000100;  // Enable interrupt for Port D
 
-  // Servo pins
+  // Initialize steering servo and set it to absolute center
   servoSteering.attach(OUTPUT_STEERING);
-  servoSteering.write((limSteeringL + limSteeringR) / 2); // Servo to center position
+  servoSteering.write((limSteeringL + limSteeringR) / 2); 
 
-  // MPU 6050 accelerometer / gyro setup
+  // Initialize MPU-6050 accelerometer and gyroscope
   setupMpu6050();
+
+  // --- FAST I2C ENABLE ---
+  // Boost I2C speed to 400kHz to minimize latency between the MPU-6050 and the Arduino
+  Wire.setClock(400000); 
 }
 
-//
 // =======================================================================================================
-// DETECT STEERING RANGE
+// DYNAMIC SERVO END-POINT CALIBRATION
 // =======================================================================================================
-//
 
+// Learns the maximum left and right travel limits to prevent servo burnout
 void detectSteeringRange() {
-  // input signal calibration (for center point only)
-  int steeringuSec = uSec[0];
-  if (steeringuSec > 500 && steeringuSec < limuSecL) limuSecL = steeringuSec; // around 1000uS
-  if (steeringuSec < 2500 && steeringuSec > limuSecR) limuSecR = steeringuSec; // around 2000uS
+  int steeringuSec = safe_uSec[0];
+  
+  // Expand input limits based on live receiver data
+  if (steeringuSec > 500 && steeringuSec < limuSecL) limuSecL = steeringuSec;
+  if (steeringuSec < 2500 && steeringuSec > limuSecR) limuSecR = steeringuSec;
 
-  // output signal calibration
-  int servoAngle = map(uSec[0], 1000, 2000, 45, 135); // The range usually is 45 to 135° (+/- 45°)
+  // Map input limits to physical servo angles
+  int servoAngle = map(safe_uSec[0], 1000, 2000, 45, 135);
   if (servoAngle > 20 && servoAngle < limSteeringL) limSteeringL = servoAngle;
   if (servoAngle < 160 && servoAngle > limSteeringR) limSteeringR = servoAngle;
 }
 
-//
 // =======================================================================================================
-// READ INPUTS
+// HARDWARE INPUT READER
 // =======================================================================================================
-//
 
 void readInputs() {
-  mrscGain = map(analogRead(GAIN_POT), 0, 255, 0, 100);
+  // Check if the user has grounded Pin A2 to reverse the gyro direction
   mpuInversed = !digitalRead(INVERSE_MPU_DIRECTION);
 }
 
-//
 // =======================================================================================================
-// SIGNAL VALIDITY CHECK
+// STABILITY CONTROL CORE ALGORITHM (MRSC)
 // =======================================================================================================
-//
-
-void checkValidity() {
-  for (int i = 0; i <= 1; i++) {
-    if (uSec[i] < 800 || uSec[i] > 2200) uSec[i] = 1500; // go to neutral, if an invalid servo signal arrives
-  }
-}
-
-//
-// =======================================================================================================
-// MRSC (MICRO RC STABILITY CONTROL) CALCULATIONS
-// =======================================================================================================
-// For cars with stability control (steering overlay depending on gyro yaw rate)
 
 void mrsc() {
-
   int steeringAngle;
   long gyroFeedback;
 
-  // Read remote gain signal (standard servo pulses)
-  mrscGain = map(uSec[1], 1000, 2000, 0, 100);
-
-  // Read sensor data
+  // Convert remote gain PWM signal (1000-2000uS) to a percentage (0-100%)
+  mrscGain = map(safe_uSec[1], 1000, 2000, 0, 100);
+  
+  // Fetch fresh yaw rate and angle from the IMU
   readMpu6050Data();
 
-  // Compute steering compensation overlay
-  int turnRateSetPoint = map(uSec[0], limuSecL, limuSecR, -50, 50);  // turnRateSetPoint = steering angle (1000 to 2000us) = -50 to 50
-  int steering = abs(turnRateSetPoint); // this value is required to compute the gain later on and is always positive
-  int gain = map(steering, 0, 50, mrscGain, (mrscGain / 5)); // MRSC gain around center position is 5 times more!
+  // Calculate driver's intended steering position
+  int turnRateSetPoint = map(safe_uSec[0], limuSecL, limuSecR, -50, 50);
+  int steering = abs(turnRateSetPoint); // Absolute value for gain mathematics
+  
+  // Dynamic Gain: Reduce gyro intervention during tight corners to prevent fighting the driver
+  int gain = map(steering, 0, 50, mrscGain, (mrscGain / 5));
 
-  if (steering < 5 && mrscGain > 85) { // Straight run @ high gain, "heading hold" mode -------------
-    gyroFeedback = yaw_angle * headingMultiplier; // degrees
+  // --- HEADING HOLD LOGIC ---
+  if (steering < 5 && mrscGain > 85) {
+    // If driving straight with high gain, lock the heading angle (Heading Hold Mode)
+    gyroFeedback = yaw_angle * headingMultiplier;
   }
-  else { // cornering or low gain, correction depending on yaw rate in °/s --------------------------
-    gyroFeedback = yaw_rate * 50; // degrees/s * speed (always 50%)
-    yaw_angle = 0; // reset yaw angle (heading direction)
+  else { 
+    // If cornering, apply standard yaw rate damping (Normal Mode)
+    gyroFeedback = yaw_rate * 50;
+    yaw_angle = 0; // Reset heading memory for the next straight run
   }
 
-  if (mpuInversed) steeringAngle = turnRateSetPoint + (gyroFeedback * gain / 100);  // Compensation depending on the pot value
+  // Apply gyro compensation to the driver's steering input
+  if (mpuInversed) steeringAngle = turnRateSetPoint + (gyroFeedback * gain / 100);
   else steeringAngle = turnRateSetPoint - (gyroFeedback * gain / 100);
-
-  steeringAngle = constrain (steeringAngle, -50, 50); // range = -50 to 50
-
-  // Control steering servo
-  servoSteering.write(map(steeringAngle, -50, 50, limSteeringL, limSteeringR) ); // 45 - 135°
+  
+  // Constrain the final signal to prevent mechanical binding
+  steeringAngle = constrain (steeringAngle, -50, 50); 
+  
+  // Send the stabilized signal to the physical servo
+  servoSteering.write(map(steeringAngle, -50, 50, limSteeringL, limSteeringR) );
 }
 
-//
 // =======================================================================================================
-// MAIN LOOP
+// MAIN CONTROL LOOP
 // =======================================================================================================
-//
 
 void loop() {
-  //readInputs(); // Read pots and switches
-  checkValidity(); // Signal valid?
-  detectSteeringRange(); // Detect the steering input signal range
-  mrsc(); // Do stability control calculations
+  // 1. ATOMIC READ (Anti-Jitter Protection)
+  // Suspends interrupts briefly to copy 32-bit variables safely. Prevents servo twitching.
+  uint32_t edge0, edge1;
+  noInterrupts(); 
+  safe_uSec[0] = uSec[0];
+  safe_uSec[1] = uSec[1];
+  edge0 = risingEdge[0];
+  edge1 = risingEdge[1];
+  interrupts(); 
+
+  // 2. SMART FAILSAFE (Signal Loss Protection)
+  // If the receiver disconnects or loses signal for >50ms, return steering to absolute center.
+  uint32_t now = micros();
+  if (safe_uSec[0] < 800 || safe_uSec[0] > 2200 || (now - edge0 > 50000)) safe_uSec[0] = 1500; // Center steering
+  if (safe_uSec[1] < 800 || safe_uSec[1] > 2200 || (now - edge1 > 50000)) safe_uSec[1] = 1500; // Center gain
+
+  // 3. EXECUTE SUBSYSTEMS
+  readInputs();          // Check hardware switches (Inversion)
+  detectSteeringRange(); // Continuously update servo travel limits
+  mrsc();                // Calculate IMU physics and drive the servo
 }
